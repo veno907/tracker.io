@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Couple's Monthly Finance Tracker (PWA Ready)</title>
+    
+    <!-- PWA Requirements -->
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <meta name="apple-mobile-web-app-title" content="Fin Tracker">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Chart.js CDN for data visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fc; }
+        .card { transition: all 0.3s ease; }
+        .card:hover { transform: translateY(-3px); box-shadow: 0 10px 15px rgba(0, 10, 20, 0.1); }
+        .savings-positive { background-color: #d1fae5; color: #065f46; border-color: #34d399; }
+        .savings-negative { background-color: #fee2e2; color: #991b1b; border-color: #f87171; }
+        .budget-over { background-color: #fef2f2; border: 2px solid #f87171; }
+        .budget-under { background-color: #f0fdf4; border: 2px solid #34d399; }
+    </style>
+    <script type="module">
+        // Firebase imports for a persistent and secure application
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, collection, query, onSnapshot, orderBy, serverTimestamp, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // PWA: Register Service Worker for Offline Caching
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                // NOTE: Service Worker registration may fail in non-standard preview environments 
+                // due to security restrictions on the protocol (e.g., 'blob:'). 
+                // This is expected and will work correctly when hosted on a standard HTTPS server.
+                navigator.serviceWorker.register('./service-worker.js')
+                    .then(registration => {
+                        console.log('Service Worker registered:', registration);
+                    })
+                    .catch(error => {
+                        console.error('Service Worker registration failed (This is expected in the preview environment):', error);
+                    });
+            });
+        }
+        
+        // Configuration and Initialization
+        setLogLevel('Debug');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+        let app, db, auth, userId = null;
+        let isAuthReady = false;
+        let expenseChart = null;
+        let budgetChart = null;
+        
+        if (Object.keys(firebaseConfig).length > 0) {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // Authentication Setup
+            const authenticate = async () => {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined') {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                }
+            };
+            
+            // Listen for auth state changes and set up Firestore listeners
+            onAuthStateChanged(auth, (user) => {
+                isAuthReady = true;
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('user-info').textContent = `User ID: ${userId}`;
+                    startDataListeners();
+                } else {
+                    userId = null;
+                    document.getElementById('user-info').textContent = 'Authenticating...';
+                }
+            });
+
+            authenticate();
+        } else {
+            console.error("Firebase configuration is missing. Data will not be saved.");
+            document.getElementById('user-info').textContent = 'Offline Mode (No Persistence)';
+            isAuthReady = true;
+            startDataListeners(); 
+        }
+
+        // --- Core Functions ---
+
+        const currencyFormatter = new Intl.NumberFormat('en-US', {
+            style: 'currency',
+            currency: 'USD',
+            minimumFractionDigits: 2,
+        });
+
+        let currentEntries = [];
+        const EXPENSE_CATEGORIES = ['Rent/Mortgage', 'Groceries', 'Utilities', 'Transportation', 'Entertainment', 'Debt', 'Investments', 'Personal Care', 'Miscellaneous'];
+        const CHART_COLORS = [
+            '#4f46e5', '#10b981', '#f97316', '#ef4444', '#06b6d4', '#8b5cf6', '#f59e0b', '#ec4899', '#34d399'
+        ];
+
+        const getFinanceCollectionRef = () => {
+             if (!db || !userId) return null;
+             // Private data path: /artifacts/{appId}/users/{userId}/monthly_finances
+             return collection(db, `artifacts/${appId}/users/${userId}/monthly_finances`);
+        };
+        
+        /**
+         * Aggregates expenses from two users into a single object by category.
+         * @param {object} entry - The monthly finance entry document.
+         * @returns {object} Aggregated expense object (e.g., { 'Rent/Mortgage': 1500, ... })
+         */
+        const aggregateExpenses = (entry) => {
+            const aggregated = {};
+            
+            const users = ['user1', 'user2'];
+            users.forEach(userKey => {
+                const userExpenses = entry[userKey]?.expenses || {};
+                for (const [category, amount] of Object.entries(userExpenses)) {
+                    aggregated[category] = (aggregated[category] || 0) + amount;
+                }
+            });
+
+            return aggregated;
+        };
+        
+        const calculateTotals = (entry) => {
+            const user1 = entry.user1 || { income: 0, expenses: {} };
+            const user2 = entry.user2 || { income: 0, expenses: {} };
+
+            const totalIncome = user1.income + user2.income;
+            const aggregatedExpenses = aggregateExpenses(entry);
+            const totalExpenses = Object.values(aggregatedExpenses).reduce((sum, amount) => sum + amount, 0);
+            const totalExpenseGoal = entry.totalExpenseGoal || 0;
+            const netSavings = totalIncome - totalExpenses;
+            
+            return {
+                totalIncome,
+                totalExpenses,
+                totalExpenseGoal,
+                netSavings,
+                aggregatedExpenses
+            };
+        };
+
+
+        const startDataListeners = () => {
+            if (!isAuthReady || !userId || !db) return;
+            
+            // NOTE: orderBy('timestamp', 'desc') is crucial to ensure the dashboard uses the latest data.
+            const q = query(getFinanceCollectionRef(), orderBy('timestamp', 'desc'));
+
+            onSnapshot(q, (snapshot) => {
+                currentEntries = [];
+                snapshot.forEach((doc) => {
+                    // Include the Firestore ID as the document ID is the monthYear string
+                    currentEntries.push({ id: doc.id, ...doc.data() });
+                });
+                renderDashboard(currentEntries);
+                renderHistory(currentEntries);
+            }, (error) => {
+                console.error("Error fetching finance data: ", error);
+                document.getElementById('dashboard-status').textContent = 'Error loading data.';
+            });
+        };
+
+        const renderDashboard = (entries) => {
+            const dashboard = document.getElementById('dashboard-view');
+            
+            if (entries.length === 0) {
+                dashboard.innerHTML = '<div class="text-center py-8 text-gray-500">No monthly data entered yet. Head to the "Data Entry" tab!</div>';
+                return;
+            }
+
+            const latestEntry = entries[0];
+            const { totalIncome, totalExpenses, totalExpenseGoal, netSavings, aggregatedExpenses } = calculateTotals(latestEntry);
+            
+            const savingsRate = totalIncome > 0 ? (netSavings / totalIncome) * 100 : 0;
+            const savingsClass = netSavings >= 0 ? 'savings-positive' : 'savings-negative';
+            const savingsIcon = netSavings >= 0 ? '▲' : '▼';
+
+            const budgetDifference = totalExpenseGoal - totalExpenses; 
+            const budgetStatusClass = budgetDifference >= 0 ? 'budget-under border-green-500' : 'budget-over border-red-500';
+            const budgetStatusText = budgetDifference >= 0 ? 'Under Budget' : 'Over Budget';
+
+            // Calculate All-Time Net Savings
+            const allTimeNetSavings = entries.reduce((sum, entry) => {
+                const { netSavings: monthSavings } = calculateTotals(entry);
+                return sum + monthSavings;
+            }, 0);
+            
+            const allTimeClass = allTimeNetSavings >= 0 ? 'savings-positive' : 'savings-negative';
+            
+            const expenseListHtml = Object.entries(aggregatedExpenses)
+                .filter(([, amount]) => amount > 0)
+                .sort((a, b) => b[1] - a[1]) // Sort by amount descending
+                .map(([category, amount]) => 
+                    `<li class="flex justify-between text-sm py-1 border-b border-gray-100 last:border-b-0">
+                        <span>${category}</span>
+                        <span class="font-medium">${currencyFormatter.format(amount)}</span>
+                    </li>`
+                ).join('');
+            
+            dashboard.innerHTML = `
+                <h2 class="text-3xl font-bold text-gray-800 mb-6">Financial Overview: ${latestEntry.monthYear}</h2>
+                <div id="dashboard-status" class="hidden"></div>
+                
+                <!-- Key Metrics Grid -->
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-6 mb-8">
+                    <!-- Total Income Card -->
+                    <div class="card p-6 bg-white rounded-xl shadow-lg border-l-4 border-emerald-500">
+                        <p class="text-sm font-medium text-gray-500">Total Income</p>
+                        <p class="text-3xl font-extrabold text-gray-900 mt-1">${currencyFormatter.format(totalIncome)}</p>
+                    </div>
+
+                    <!-- Total Actual Expenses Card -->
+                    <div class="card p-6 bg-white rounded-xl shadow-lg border-l-4 border-rose-500">
+                        <p class="text-sm font-medium text-gray-500">Actual Expenses</p>
+                        <p class="text-3xl font-extrabold text-gray-900 mt-1">${currencyFormatter.format(totalExpenses)}</p>
+                    </div>
+
+                    <!-- Budget Goal Card -->
+                    <div class="card p-6 bg-white rounded-xl shadow-lg border-l-4 border-indigo-500">
+                        <p class="text-sm font-medium text-gray-500">Budget Goal</p>
+                        <p class="text-3xl font-extrabold text-indigo-700 mt-1">${currencyFormatter.format(totalExpenseGoal)}</p>
+                    </div>
+
+                    <!-- Net Savings Card -->
+                    <div class="card p-6 rounded-xl shadow-lg border-l-4 ${netSavings >= 0 ? 'border-green-500' : 'border-red-500'} ${savingsClass}">
+                        <p class="text-sm font-medium">Net Savings</p>
+                        <p class="text-3xl font-extrabold mt-1">${savingsIcon} ${currencyFormatter.format(netSavings)}</p>
+                        <p class="text-xs mt-2 opacity-80">Savings Rate: ${savingsRate.toFixed(1)}%</p>
+                    </div>
+
+                    <!-- Budget Status Card -->
+                    <div class="card p-6 rounded-xl shadow-lg ${budgetStatusClass}">
+                        <p class="text-sm font-medium">Budget Status</p>
+                        <p class="text-2xl font-extrabold mt-1">${currencyFormatter.format(Math.abs(budgetDifference))}</p>
+                        <p class="text-xs mt-2 font-bold">${budgetStatusText}</p>
+                    </div>
+                </div>
+
+                <!-- Visualization and Breakdown Section -->
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    
+                    <!-- Expense Breakdown Chart (2/3 width) -->
+                    <div class="lg:col-span-2 card p-6 bg-white rounded-xl shadow-lg">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-700 border-b pb-2">Expense Breakdown (${latestEntry.monthYear})</h3>
+                        <div style="max-height: 400px;"><canvas id="expensePieChart"></canvas></div>
+                        <ul class="mt-4 divide-y divide-gray-50">
+                            ${expenseListHtml}
+                        </ul>
+                    </div>
+
+                    <!-- Budget Comparison Chart (1/3 width) -->
+                    <div class="lg:col-span-1 card p-6 bg-white rounded-xl shadow-lg flex flex-col justify-between">
+                        <div>
+                            <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 mb-4">Budget vs. Actual</h3>
+                            <div style="height: 250px;"><canvas id="budgetBarChart"></canvas></div>
+                        </div>
+                        
+                        <!-- All-Time Health Card (Combined for space) -->
+                        <div class="mt-6 p-4 rounded-xl shadow-inner ${allTimeClass} border border-opacity-50">
+                            <h3 class="text-md font-semibold mb-2">Aggregate Financial Health</h3>
+                            <p class="text-3xl font-extrabold">${currencyFormatter.format(allTimeNetSavings)}</p>
+                            <p class="text-xs mt-1 opacity-80">Cumulative Savings Across ${entries.length} Months</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+            renderCharts(aggregatedExpenses, totalExpenses, totalExpenseGoal);
+        };
+        
+        const renderCharts = (aggregatedExpenses, actualExpenses, budgetGoal) => {
+            const expenseData = Object.entries(aggregatedExpenses)
+                .filter(([, amount]) => amount > 0)
+                .sort((a, b) => b[1] - a[1]); 
+            
+            const labels = expenseData.map(([category]) => category);
+            const data = expenseData.map(([, amount]) => amount);
+
+            // --- 1. Expense Pie Chart ---
+            const ctxPie = document.getElementById('expensePieChart');
+            if (!ctxPie) return;
+            const ctxPie2d = ctxPie.getContext('2d');
+            if (expenseChart) expenseChart.destroy(); 
+            
+            expenseChart = new Chart(ctxPie2d, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: CHART_COLORS.slice(0, data.length),
+                        hoverOffset: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right' },
+                        title: { display: false }
+                    }
+                }
+            });
+
+            // --- 2. Budget Comparison Bar Chart ---
+            const ctxBar = document.getElementById('budgetBarChart');
+            if (!ctxBar) return;
+            const ctxBar2d = ctxBar.getContext('2d');
+            if (budgetChart) budgetChart.destroy(); 
+
+            budgetChart = new Chart(ctxBar2d, {
+                type: 'bar',
+                data: {
+                    labels: ['Expenses'],
+                    datasets: [
+                        {
+                            label: 'Budget Goal',
+                            data: [budgetGoal],
+                            backgroundColor: '#4f46e5',
+                            borderRadius: 6
+                        },
+                        {
+                            label: 'Actual Expenses',
+                            data: [actualExpenses],
+                            backgroundColor: '#ef4444',
+                            borderRadius: 6
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    indexAxis: 'y', 
+                    scales: {
+                        x: { beginAtZero: true },
+                        y: { stacked: false }
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.parsed.x !== null) {
+                                        label += currencyFormatter.format(context.parsed.x);
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        };
+
+        const renderHistory = (entries) => {
+            const historyTableBody = document.getElementById('history-table-body');
+            if (!historyTableBody) return;
+
+            if (entries.length === 0) {
+                historyTableBody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-gray-500">No history found.</td></tr>';
+                return;
+            }
+
+            const historyRows = entries.map(entry => {
+                const { totalIncome, totalExpenses, totalExpenseGoal, netSavings } = calculateTotals(entry);
+                
+                const budgetDiff = totalExpenseGoal - totalExpenses;
+                const savingsClass = netSavings >= 0 ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800';
+                const budgetClass = budgetDiff >= 0 ? 'text-green-600' : 'text-red-600';
+
+                return `
+                    <tr class="hover:bg-gray-50 transition duration-150">
+                        <td class="px-4 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${entry.monthYear}</td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">${currencyFormatter.format(totalIncome)}</td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">${currencyFormatter.format(totalExpenses)}</td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">${currencyFormatter.format(totalExpenseGoal)}</td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm ${budgetClass}">${currencyFormatter.format(budgetDiff)}</td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm">
+                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${savingsClass}">
+                                ${currencyFormatter.format(netSavings)}
+                            </span>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+
+            historyTableBody.innerHTML = historyRows;
+        };
+
+        /**
+         * Loads data for a selected month into the active form and shared inputs.
+         * @param {string} monthYear - The document ID (e.g., '2025-11').
+         */
+        const loadFormData = async (monthYear) => {
+            const userForms = {
+                user1: document.getElementById('user1-form'),
+                user2: document.getElementById('user2-form')
+            };
+
+            // Clear all forms first
+            userForms.user1.reset();
+            userForms.user2.reset();
+            document.getElementById('totalExpenseGoal').value = '';
+
+            if (!monthYear || !db || !userId) return;
+
+            const docRef = doc(getFinanceCollectionRef(), monthYear);
+            try {
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) {
+                    const entry = docSnap.data();
+                    
+                    // Set shared inputs
+                    document.getElementById('totalExpenseGoal').value = entry.totalExpenseGoal || '';
+
+                    // Set user1 data
+                    if (entry.user1) {
+                        document.getElementById('income-user1').value = entry.user1.income || '';
+                        EXPENSE_CATEGORIES.forEach(category => {
+                            const id = 'expense-' + category.replace(/\s/g, '') + '-user1';
+                            document.getElementById(id).value = entry.user1.expenses[category] || '';
+                        });
+                    }
+
+                    // Set user2 data
+                    if (entry.user2) {
+                        document.getElementById('income-user2').value = entry.user2.income || '';
+                        EXPENSE_CATEGORIES.forEach(category => {
+                            const id = 'expense-' + category.replace(/\s/g, '') + '-user2';
+                            document.getElementById(id).value = entry.user2.expenses[category] || '';
+                        });
+                    }
+                }
+            } catch (e) {
+                console.error("Error loading document:", e);
+                alertModal("Error", "Failed to load data for this month.");
+            }
+        };
+
+        const handleFormSubmit = async (event) => {
+            event.preventDefault();
+            
+            const form = event.target;
+            const userKey = form.getAttribute('data-user'); // 'user1' or 'user2'
+            
+            const monthYearInput = document.getElementById('monthYear');
+            const goalInput = document.getElementById('totalExpenseGoal');
+
+            const monthYear = monthYearInput.value;
+            const totalExpenseGoal = parseFloat(goalInput.value) || 0; 
+            
+            if (!monthYear) {
+                alertModal("Error", "Please select a Month and Year in the shared section.");
+                return;
+            }
+            if (!db || !userId) {
+                alertModal("Error", "Authentication is still initializing. Please wait a moment.");
+                return;
+            }
+
+            const income = parseFloat(document.getElementById(`income-${userKey}`).value) || 0;
+            const expenses = {};
+            let hasValidExpense = false;
+
+            EXPENSE_CATEGORIES.forEach(category => {
+                const id = 'expense-' + category.replace(/\s/g, '') + `-${userKey}`;
+                const input = document.getElementById(id);
+                const amount = parseFloat(input.value) || 0;
+                if (amount >= 0) {
+                    expenses[category] = amount;
+                    if (amount > 0) hasValidExpense = true;
+                }
+            });
+
+            if (income === 0 && !hasValidExpense) {
+                alertModal("Warning", `Please enter at least one income or expense value for the ${userKey === 'user1' ? 'My' : 'Girlfriend\'s'} data.`);
+                return;
+            }
+
+            const docRef = doc(getFinanceCollectionRef(), monthYear);
+            
+            // Fetch existing data or initialize new entry
+            const docSnap = await getDoc(docRef);
+            const existingEntry = docSnap.exists() ? docSnap.data() : {};
+            
+            // Create the updated entry data
+            const updatedEntry = {
+                ...existingEntry,
+                monthYear: monthYear,
+                totalExpenseGoal: totalExpenseGoal,
+                timestamp: serverTimestamp(),
+                [userKey]: {
+                    income: income,
+                    expenses: expenses
+                }
+            };
+            
+            try {
+                await setDoc(docRef, updatedEntry);
+                alertModal("Success", `Data for ${monthYear} (${userKey === 'user1' ? 'Me' : 'Girlfriend'}) saved successfully!`);
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                alertModal("Error", "Failed to save data. See console for details.");
+            }
+        };
+
+        // --- UI Logic ---
+        
+        const setupUI = () => {
+            document.getElementById('user1-form').addEventListener('submit', handleFormSubmit);
+            document.getElementById('user2-form').addEventListener('submit', handleFormSubmit);
+
+            const user1ExpenseContainer = document.getElementById('expense-input-container-user1');
+            const user2ExpenseContainer = document.getElementById('expense-input-container-user2');
+            
+            // Dynamically generate expense inputs for both users
+            EXPENSE_CATEGORIES.forEach(category => {
+                // User 1
+                const id1 = 'expense-' + category.replace(/\s/g, '') + '-user1';
+                user1ExpenseContainer.innerHTML += createExpenseInputHtml(id1, category);
+
+                // User 2
+                const id2 = 'expense-' + category.replace(/\s/g, '') + '-user2';
+                user2ExpenseContainer.innerHTML += createExpenseInputHtml(id2, category);
+            });
+
+            // Handle MonthYear change to load existing data
+            document.getElementById('monthYear').addEventListener('change', (e) => loadFormData(e.target.value));
+
+            // Set up main tab switching (Dashboard / Data Entry)
+            const dashboardBtn = document.getElementById('tab-dashboard');
+            const entryBtn = document.getElementById('tab-entry');
+            const dashboardView = document.getElementById('dashboard-view');
+            const entryView = document.getElementById('entry-view');
+
+            const switchMainTab = (activeTab) => {
+                if (activeTab === 'dashboard') {
+                    dashboardBtn.classList.add('bg-indigo-600', 'text-white');
+                    dashboardBtn.classList.remove('text-gray-700', 'hover:bg-indigo-50');
+                    entryBtn.classList.add('text-gray-700', 'hover:bg-indigo-50');
+                    entryBtn.classList.remove('bg-indigo-600', 'text-white');
+                    dashboardView.classList.remove('hidden');
+                    entryView.classList.add('hidden');
+                } else {
+                    entryBtn.classList.add('bg-indigo-600', 'text-white');
+                    entryBtn.classList.remove('text-gray-700', 'hover:bg-indigo-50');
+                    dashboardBtn.classList.add('text-gray-700', 'hover:bg-indigo-50');
+                    dashboardBtn.classList.remove('bg-indigo-600', 'text-white');
+                    entryView.classList.remove('hidden');
+                    dashboardView.classList.add('hidden');
+                }
+            };
+
+            dashboardBtn.addEventListener('click', () => switchMainTab('dashboard'));
+            entryBtn.addEventListener('click', () => switchMainTab('entry'));
+            
+            // Set up sub-tab switching (User 1 / User 2)
+            const user1Btn = document.getElementById('sub-tab-user1');
+            const user2Btn = document.getElementById('sub-tab-user2');
+            const user1Form = document.getElementById('user1-form');
+            const user2Form = document.getElementById('user2-form');
+
+            const switchSubTab = (activeUser) => {
+                if (activeUser === 'user1') {
+                    user1Btn.classList.add('bg-indigo-600', 'text-white');
+                    user1Btn.classList.remove('text-gray-700', 'hover:bg-indigo-50');
+                    user2Btn.classList.add('text-gray-700', 'hover:bg-indigo-50');
+                    user2Btn.classList.remove('bg-indigo-600', 'text-white');
+                    user1Form.classList.remove('hidden');
+                    user2Form.classList.add('hidden');
+                } else {
+                    user2Btn.classList.add('bg-indigo-600', 'text-white');
+                    user2Btn.classList.remove('text-gray-700', 'hover:bg-indigo-50');
+                    user1Btn.classList.add('text-gray-700', 'hover:bg-indigo-50');
+                    user1Btn.classList.remove('bg-indigo-600', 'text-white');
+                    user2Form.classList.remove('hidden');
+                    user1Form.classList.add('hidden');
+                }
+            };
+
+            user1Btn.addEventListener('click', () => switchSubTab('user1'));
+            user2Btn.addEventListener('click', () => switchSubTab('user2'));
+
+            switchMainTab('dashboard');
+            switchSubTab('user1'); // Default to "My Data"
+        };
+        
+        const createExpenseInputHtml = (id, category) => {
+            return `
+                <div class="relative">
+                    <label for="${id}" class="block text-sm font-medium text-gray-700">${category}</label>
+                    <div class="mt-1 flex rounded-md shadow-sm">
+                        <span class="inline-flex items-center px-3 rounded-l-md border border-r-0 border-gray-300 bg-gray-50 text-gray-500 sm:text-sm">$</span>
+                        <input type="number" step="0.01" min="0" id="${id}" name="${id}" class="flex-1 block w-full rounded-none rounded-r-md sm:text-sm border-gray-300 p-2 focus:ring-green-500 focus:border-green-500" placeholder="0.00">
+                    </div>
+                </div>
+            `;
+        };
+
+        const alertModal = (title, message) => {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            
+            document.getElementById('modal-close').onclick = () => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            };
+        };
+
+        window.onload = setupUI;
+    </script>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+    
+    <!-- Custom Modal for Alerts -->
+    <div id="custom-modal" class="hidden fixed inset-0 z-50 overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true">
+        <div class="flex items-center justify-center min-h-screen px-4 pt-4 pb-20 text-center sm:block sm:p-0">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity" aria-hidden="true"></div>
+            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
+            <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full">
+                <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+                    <div class="sm:flex sm:items-start">
+                        <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-indigo-100 sm:mx-0 sm:h-10 sm:w-10">
+                            <!-- Icon -->
+                            <svg class="h-6 w-6 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                        </div>
+                        <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
+                            <h3 class="text-lg leading-6 font-medium text-gray-900" id="modal-title"></h3>
+                            <div class="mt-2">
+                                <p class="text-sm text-gray-500" id="modal-message"></p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+                    <button type="button" id="modal-close" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 sm:ml-3 sm:w-auto sm:text-sm">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Application Container -->
+    <div class="max-w-6xl mx-auto bg-white p-6 rounded-2xl shadow-2xl">
+        <header class="pb-4 border-b">
+            <h1 class="text-4xl font-extrabold text-gray-900 mb-2">💰 Financial Health Tracker</h1>
+            <p class="text-gray-500 text-sm" id="user-info">Initializing...</p>
+        </header>
+
+        <!-- Tabs Navigation (Main) -->
+        <div class="mt-4 flex space-x-2 p-1 bg-gray-100 rounded-lg max-w-sm">
+            <button id="tab-dashboard" class="flex-1 py-2 px-4 rounded-lg font-medium text-sm transition-colors duration-200">
+                Dashboard
+            </button>
+            <button id="tab-entry" class="flex-1 py-2 px-4 rounded-lg font-medium text-sm transition-colors duration-200">
+                Data Entry
+            </button>
+        </div>
+
+        <!-- Dashboard View -->
+        <div id="dashboard-view" class="mt-6">
+            <div class="text-center py-16 text-gray-400">Loading financial data...</div>
+        </div>
+
+        <!-- Data Entry View (Refactored with Sub-Tabs) -->
+        <div id="entry-view" class="hidden mt-6">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-6">Enter Monthly Actuals & Goals</h2>
+            
+            <!-- Shared Monthly Goal/Date Input -->
+            <div class="mb-6 grid grid-cols-1 sm:grid-cols-2 gap-4 bg-gray-50 p-4 rounded-xl">
+                <!-- Month Picker -->
+                <div>
+                    <label for="monthYear" class="block text-sm font-medium text-gray-700">Month & Year</label>
+                    <input type="month" id="monthYear" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <!-- Budget Goal Input -->
+                <div>
+                    <label for="totalExpenseGoal" class="block text-sm font-medium text-gray-700">Total Monthly Expense Goal</label>
+                    <div class="mt-1 flex rounded-md shadow-sm">
+                        <span class="inline-flex items-center px-3 rounded-l-md border border-r-0 border-gray-300 bg-gray-50 text-gray-500 sm:text-sm">$</span>
+                        <input type="number" step="0.01" min="0" id="totalExpenseGoal" class="flex-1 block w-full rounded-none rounded-r-md sm:text-sm border-gray-300 p-2 focus:ring-indigo-500 focus:border-indigo-500" placeholder="e.g., 4500.00">
+                    </div>
+                    <p class="mt-1 text-xs text-gray-500">Set your combined maximum spending goal.</p>
+                </div>
+            </div>
+            
+            <!-- Sub-Tabs Navigation (User 1 vs User 2) -->
+            <div class="flex space-x-2 p-1 bg-gray-100 rounded-lg max-w-md mx-auto mb-6">
+                <button id="sub-tab-user1" class="flex-1 py-2 px-4 rounded-lg font-medium text-sm transition-colors duration-200">
+                    My Data
+                </button>
+                <button id="sub-tab-user2" class="flex-1 py-2 px-4 rounded-lg font-medium text-sm transition-colors duration-200">
+                    Girlfriend's Data
+                </button>
+            </div>
+
+            <!-- Form 1: My Data (User 1) -->
+            <form id="user1-form" data-user="user1" class="space-y-6">
+                <h3 class="text-xl font-semibold text-gray-800 border-b pb-2">My Income & Expenses</h3>
+                <!-- Income Section -->
+                <div class="bg-blue-50 p-4 rounded-xl border border-blue-200">
+                    <h4 class="text-lg font-semibold text-blue-800 mb-4">My Income (Actual)</h4>
+                    <div>
+                        <label for="income-user1" class="block text-sm font-medium text-gray-700">My Monthly Income</label>
+                        <div class="mt-1 flex rounded-md shadow-sm">
+                            <span class="inline-flex items-center px-3 rounded-l-md border border-r-0 border-gray-300 bg-gray-50 text-gray-500 sm:text-sm">$</span>
+                            <input type="number" step="0.01" min="0" id="income-user1" name="income" class="flex-1 block w-full rounded-none rounded-r-md sm:text-sm border-gray-300 p-2 focus:ring-blue-500 focus:border-blue-500" placeholder="0.00">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Expense Section -->
+                <div class="bg-rose-50 p-4 rounded-xl border border-rose-200">
+                    <h4 class="text-lg font-semibold text-rose-800 mb-4">My Expenses (Actual Share)</h4>
+                    <p class="text-xs text-rose-700 mb-4">Enter only the portion of the shared expenses you pay for.</p>
+                    <div id="expense-input-container-user1" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                        <!-- Expense inputs generated by JS -->
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-lg font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out">
+                    Save My Monthly Data
+                </button>
+            </form>
+
+            <!-- Form 2: Girlfriend's Data (User 2) -->
+            <form id="user2-form" data-user="user2" class="space-y-6 hidden">
+                <h3 class="text-xl font-semibold text-gray-800 border-b pb-2">Girlfriend's Income & Expenses</h3>
+                <!-- Income Section -->
+                <div class="bg-blue-50 p-4 rounded-xl border border-blue-200">
+                    <h4 class="text-lg font-semibold text-blue-800 mb-4">Girlfriend's Income (Actual)</h4>
+                    <div>
+                        <label for="income-user2" class="block text-sm font-medium text-gray-700">Girlfriend's Monthly Income</label>
+                        <div class="mt-1 flex rounded-md shadow-sm">
+                            <span class="inline-flex items-center px-3 rounded-l-md border border-r-0 border-gray-300 bg-gray-50 text-gray-500 sm:text-sm">$</span>
+                            <input type="number" step="0.01" min="0" id="income-user2" name="income" class="flex-1 block w-full rounded-none rounded-r-md sm:text-sm border-gray-300 p-2 focus:ring-blue-500 focus:border-blue-500" placeholder="0.00">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Expense Section -->
+                <div class="bg-rose-50 p-4 rounded-xl border border-rose-200">
+                    <h4 class="text-lg font-semibold text-rose-800 mb-4">Girlfriend's Expenses (Actual Share)</h4>
+                    <p class="text-xs text-rose-700 mb-4">Enter only the portion of the shared expenses your girlfriend pays for.</p>
+                    <div id="expense-input-container-user2" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                        <!-- Expense inputs generated by JS -->
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-lg font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out">
+                    Save Girlfriend's Monthly Data
+                </button>
+            </form>
+            
+            <!-- History Table -->
+            <div class="mt-10 pt-6 border-t border-gray-200">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">Historical Summary</h3>
+                <div class="overflow-x-auto rounded-lg shadow-md border border-gray-200">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Month</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total Income</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actual Expenses</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Budget Goal</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Budget Diff</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Net Savings</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table-body" class="bg-white divide-y divide-gray-200">
+                            <tr><td colspan="6" class="text-center py-4 text-gray-500">Loading history...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+</body>
+</html>
